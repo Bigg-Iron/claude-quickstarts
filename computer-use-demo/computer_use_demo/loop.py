@@ -6,9 +6,9 @@ import platform
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any, Literal, cast
 
-import httpx
+import httpx2 as httpx
 from anthropic import (
     Anthropic,
     AnthropicBedrock,
@@ -16,6 +16,7 @@ from anthropic import (
     APIError,
     APIResponseValidationError,
     APIStatusError,
+    omit,
 )
 from anthropic.types.beta import (
     BetaCacheControlEphemeralParam,
@@ -35,8 +36,25 @@ from .tools import (
     ToolResult,
     ToolVersion,
 )
+from .tools.base import ToolFailure
+
+# The tool_result content a toolset member call receives when an earlier
+# member call in the same turn failed (the exact text is part of the computer
+# toolset contract).
+NOT_EXECUTED_ERROR = "Not executed: an earlier computer action in this turn failed."
 
 PROMPT_CACHING_BETA_FLAG = "prompt-caching-2024-07-31"
+
+# How the model's reasoning is requested. Which modes a given model supports is
+# declared per-model in streamlit.py (MODEL_TO_MODEL_CONF):
+# - "adaptive": the model decides how much to think, steered by an effort level
+#   (Claude Opus 4.6 / Sonnet 4.6 and newer). Sent as
+#   thinking={"type": "adaptive"} plus output_config={"effort": ...}.
+# - "extended": a fixed thinking token budget (Claude Opus 4.5 / Sonnet 4.5 and
+#   older). Sent as thinking={"type": "enabled", "budget_tokens": ...}.
+# - "off": no thinking parameters are sent.
+ThinkingMode = Literal["adaptive", "extended", "off"]
+ThinkingEffort = Literal["low", "medium", "high", "max"]
 
 
 class APIProvider(StrEnum):
@@ -82,6 +100,8 @@ async def sampling_loop(
     only_n_most_recent_images: int | None = None,
     max_tokens: int = 4096,
     tool_version: ToolVersion,
+    thinking_mode: ThinkingMode = "off",
+    thinking_effort: ThinkingEffort = "medium",
     thinking_budget: int | None = None,
     token_efficient_tools_beta: bool = False,
 ):
@@ -125,8 +145,17 @@ async def sampling_loop(
                 min_removal_threshold=image_truncation_threshold,
             )
         extra_body = {}
-        if thinking_budget:
-            # Ensure we only send the required fields for thinking
+        if thinking_mode == "adaptive":
+            # Newer models (Claude Opus 4.6 / Sonnet 4.6 and later) reason
+            # adaptively: the model decides how much to think and the effort
+            # level steers it. These models do not accept a manual token budget.
+            extra_body = {
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": thinking_effort},
+            }
+        elif thinking_mode == "extended" and thinking_budget:
+            # Older models use extended thinking with an explicit token budget.
+            # Ensure we only send the required fields for thinking.
             extra_body = {
                 "thinking": {"type": "enabled", "budget_tokens": thinking_budget}
             }
@@ -142,7 +171,9 @@ async def sampling_loop(
                 model=model,
                 system=[system],
                 tools=tool_collection.to_params(),
-                betas=betas,
+                # The toolset group has no beta flag, so on Vertex/Bedrock the
+                # list can be empty; omit the header rather than send it blank.
+                betas=betas or omit,
                 extra_body=extra_body,
             )
         except (APIStatusError, APIResponseValidationError) as e:
@@ -167,6 +198,7 @@ async def sampling_loop(
         )
 
         tool_result_content: list[BetaToolResultBlockParam] = []
+        member_call_failed = False
         for content_block in response_params:
             output_callback(content_block)
             if (
@@ -175,12 +207,31 @@ async def sampling_loop(
             ):
                 # Type narrowing for tool use blocks
                 tool_use_block = cast(BetaToolUseBlockParam, content_block)
-                result = await tool_collection.run(
-                    name=tool_use_block["name"],
-                    tool_input=cast(dict[str, Any], tool_use_block.get("input", {})),
+                # A toolset member call carries toolset_name naming its
+                # family; its tool_result must carry the same toolset_name.
+                toolset_name = cast(
+                    str | None,
+                    cast(dict[str, Any], content_block).get("toolset_name"),
                 )
+                if toolset_name is not None and member_call_failed:
+                    # Toolset member calls run sequentially in block order and
+                    # stop on the first failure; the remaining member calls
+                    # are answered without being executed.
+                    result: ToolResult = ToolFailure(error=NOT_EXECUTED_ERROR)
+                else:
+                    result = await tool_collection.run(
+                        name=tool_use_block["name"],
+                        tool_input=cast(
+                            dict[str, Any], tool_use_block.get("input", {})
+                        ),
+                        toolset_name=toolset_name,
+                    )
+                    if toolset_name is not None and result.error:
+                        member_call_failed = True
                 tool_result_content.append(
-                    _make_api_tool_result(result, tool_use_block["id"])
+                    _make_api_tool_result(
+                        result, tool_use_block["id"], toolset_name=toolset_name
+                    )
                 )
                 tool_output_callback(result, tool_use_block["id"])
 
@@ -209,9 +260,10 @@ def _maybe_filter_to_n_most_recent_images(
         [
             item
             for message in messages
-            for item in (
-                message["content"] if isinstance(message["content"], list) else []
-            )
+            # BetaMessageParam is a union per role and only the system variant
+            # has optional content, so rule it out before indexing "content".
+            if message["role"] != "system" and isinstance(message["content"], list)
+            for item in message["content"]
             if isinstance(item, dict) and item.get("type") == "tool_result"
         ],
     )
@@ -289,9 +341,13 @@ def _inject_prompt_caching(
 
 
 def _make_api_tool_result(
-    result: ToolResult, tool_use_id: str
+    result: ToolResult, tool_use_id: str, *, toolset_name: str | None = None
 ) -> BetaToolResultBlockParam:
-    """Convert an agent ToolResult to an API ToolResultBlockParam."""
+    """Convert an agent ToolResult to an API ToolResultBlockParam.
+
+    A tool_result answering a toolset member call must carry the same
+    toolset_name as its paired tool_use block, so it is stamped here.
+    """
     tool_result_content: list[BetaTextBlockParam | BetaImageBlockParam] | str = []
     is_error = False
     if result.error:
@@ -316,12 +372,15 @@ def _make_api_tool_result(
                     },
                 }
             )
-    return {
+    tool_result_block: dict[str, Any] = {
         "type": "tool_result",
         "content": tool_result_content,
         "tool_use_id": tool_use_id,
         "is_error": is_error,
     }
+    if toolset_name is not None:
+        tool_result_block["toolset_name"] = toolset_name
+    return cast(BetaToolResultBlockParam, tool_result_block)
 
 
 def _maybe_prepend_system_tool_result(result: ToolResult, result_text: str):

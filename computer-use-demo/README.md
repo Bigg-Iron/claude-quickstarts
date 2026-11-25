@@ -1,7 +1,7 @@
 # Anthropic Computer Use Demo
 
 > [!NOTE]
-> Now featuring support for the new Claude 4 models! The latest Claude Opus 4.5 (claude-opus-4-5-20251101) is now available, along with Claude Sonnet 4.5 (claude-sonnet-4-5-20250929), Claude Sonnet 4 (claude-sonnet-4-20250514), Claude Opus 4 (claude-opus-4-20250514), and Claude Haiku 4.5 (claude-haiku-4-5-20251001). These models bring next-generation capabilities with the updated str_replace_based_edit_tool that replaces the previous str_replace_editor tool. The undo_edit command has been removed in this latest version for a more streamlined experience.
+> The demo now defaults to Claude Opus 4.8 (claude-opus-4-8), the latest model, with adaptive thinking — the model decides how much to reason, steered by a selectable effort level. Claude Opus 4.7, Opus 4.6, and Sonnet 4.6 are also supported with adaptive thinking, while older models (Claude Opus 4.5, Sonnet 4.5, Sonnet 4, Opus 4, and Haiku 4.5) continue to work with extended thinking and the str_replace_based_edit_tool.
 
 > [!CAUTION]
 > Computer use is a beta feature. Please be aware that computer use poses unique risks that are distinct from standard API features or chat interfaces. These risks are heightened when using computer use to interact with the internet. To minimize risks, consider taking precautions such as:
@@ -22,6 +22,9 @@ This repository helps you get started with computer use on Claude, with referenc
 - Anthropic-defined computer use tools
 - A streamlit app for interacting with the agent loop
 
+> [!TIP]
+> **Looking for production-readiness patterns?** This demo is a deliberately minimal, containerized reference: it shows the essential agent loop running against a Linux desktop in Docker with X11 + VNC. If you want to see common patterns for making computer-use agents more reliable and cost-effective — explicit tool definitions, image sizing and pruning, prompt caching, server-side compaction, batched tool calls, a sandboxed shell, and trajectory recording — see the [Computer Use Best Practices](../computer-use-best-practices) quickstart, which runs natively on macOS (no container) and pairs with Anthropic's [computer-use best-practices guide](https://claude.com/blog/best-practices-for-computer-and-browser-use-with-claude).
+
 Please use [this form](https://forms.gle/BT1hpBrqDPDUrCqo7) to provide feedback on the quality of the model responses, the API itself, or the quality of the documentation - we cannot wait to hear from you!
 
 > [!IMPORTANT]
@@ -29,6 +32,12 @@ Please use [this form](https://forms.gle/BT1hpBrqDPDUrCqo7) to provide feedback 
 
 > [!IMPORTANT]
 > The components are weakly separated: the agent loop runs in the container being controlled by Claude, can only be used by one session at a time, and must be restarted or reset between sessions if necessary.
+
+## Tool versions
+
+The demo supports every dated version of the Anthropic-defined computer use tools, selectable in the app's sidebar. The sidebar defaults to the version matching the selected model.
+
+The most recent shape, `computer_toolset_20260801`, declares the computer tool as a *toolset*: a single nameless entry in `tools[]` that declares one member tool per computer action. The model then calls each action as its own tool — `tool_use.name` is the member name (`left_click`, `screenshot`, ...), the block carries `toolset_name: "computer"`, and the input is that action's parameters with no `action` discriminator. Every `tool_result` answering a member call carries the same `toolset_name`, member calls in a turn run sequentially and stop on the first failure, and the toolset requires no `anthropic-beta` header. Earlier dated versions of the tool (API types `computer_20241022` through `computer_20251124`, the sidebar's `computer_use_*` entries) keep the single `computer` tool with an `action` parameter and their respective beta headers. A model supports either the toolset or the earlier dated versions it was trained with — check the [computer use documentation](https://docs.claude.com/en/docs/agents-and-tools/computer-use) for each model's supported versions.
 
 ## Quickstart: running the Docker container
 
